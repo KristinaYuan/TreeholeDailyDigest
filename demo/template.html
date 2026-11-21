@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN" data-treehole-demo="true">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>树洞日报 · 虚构演示</title>
+<style>body{margin:0;background:#e9eee4;color:#344d39;font:16px -apple-system,BlinkMacSystemFont,sans-serif}main{padding:10vh 8vw}h1{font-size:36px}p{line-height:1.8}</style></head>
+<body><main><h1>树洞日报</h1><p>这是使用虚构帖子的本地演示。点击右下角「树洞日报」打开。<br>真实使用请将项目生成的用户脚本安装到篡改猴，再访问树洞网站。</p><a href="../dist/treehole-digest.user.js">查看 / 安装用户脚本</a></main>
+<noscript><p>请在浏览器中允许 JavaScript 后查看交互演示。</p></noscript>
+<script>
+window.addEventListener('error', function (event) {
+  const error = document.createElement('p');
+  error.style.cssText = 'color:#a22;padding:20px;white-space:pre-wrap';
+  error.textContent = '演示未能运行：' + event.message;
+  document.body.append(error);
+});
+</script>
+<!-- DIGEST_SCRIPTS -->
+</body></html>

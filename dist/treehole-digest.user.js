@@ -1,0 +1,557 @@
+// ==UserScript==
+// @name         PKU Treehole · Daily Digest
+// @namespace    treehole-daily-digest.local
+// @version      0.1.0
+// @author       Kristina
+// @homepageURL  https://github.com/KristinaYuan/TreeholeDailyDigest
+// @updateURL    https://github.com/KristinaYuan/TreeholeDailyDigest/releases/latest/download/treehole-digest.user.js
+// @downloadURL  https://github.com/KristinaYuan/TreeholeDailyDigest/releases/latest/download/treehole-digest.user.js
+// @description  今日热门、关键词订阅与短期缓存；复用网页登录态，不向第三方发送内容。
+// @match        https://treehole.pku.edu.cn/ch/web/*
+// @match        https://treehole.pku.edu.cn/web/*
+// @run-at       document-end
+// @grant        none
+// @noframes
+// ==/UserScript==
+
+(function () {
+/* Shared by the userscript, demo and Node tests. No browser credentials here. */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.TreeholeDigestCore = api;
+})(globalThis, function () {
+  'use strict';
+
+  const ZONE = 'Asia/Shanghai';
+  const API_PATH = '/chapi/api/v3/hole/list_comments';
+  const CACHE_TTL_MS = 5 * 60 * 1000;
+  const fold = value => String(value ?? '').normalize('NFKC').trim().toLocaleLowerCase('zh-CN');
+
+  function dayKey(now = Date.now()) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: ZONE, year: 'numeric', month: '2-digit', day: '2-digit'
+    }).formatToParts(new Date(now));
+    const get = type => parts.find(part => part.type === type).value;
+    return `${get('year')}-${get('month')}-${get('day')}`;
+  }
+
+  function timeWindow(date, rolling = false, now = Date.now()) {
+    if (rolling) return { start: now - 86400000, end: now, date: '过去 24 小时' };
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('请选择有效日期');
+    const start = Date.parse(`${date}T00:00:00+08:00`);
+    if (!Number.isFinite(start) || dayKey(start) !== date) throw new Error('请选择有效日期');
+    return { start, end: Math.min(start + 86400000, now + 1), date };
+  }
+
+  function timestamp(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number < 1e11 ? number * 1000 : number;
+    const text = String(value).trim().replace(' ', 'T');
+    const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+    const parsed = Date.parse(hasZone ? text : `${text}+08:00`);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function count(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
+  }
+
+  function labelNames(value) {
+    if (!value) return [];
+    if (typeof value === 'string') return [value];
+    if (Array.isArray(value)) return value.flatMap(labelNames);
+    if (typeof value === 'object') return labelNames(value.name ?? value.label_name ?? value.label ?? value.text);
+    return [];
+  }
+
+  function normalizePost(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const id = String(raw.pid ?? raw.id ?? '');
+    const createdAt = timestamp(raw.timestamp ?? raw.created_at ?? raw.create_time);
+    if (!/^[1-9]\d*$/.test(id) || createdAt === null || typeof raw.text !== 'string') return null;
+    const tags = [...new Set([
+      ...labelNames(raw.label_info), ...labelNames(raw.labels), ...labelNames(raw.tags),
+      ...Array.from(raw.text.matchAll(/(?:^|[\s，。；,;！!？?（(])#([^\s#，。；,;！!？?（）()]+)/gu), match => match[1])
+        .filter(tag => !/^\d+$/.test(tag))
+    ].map(fold).filter(Boolean))];
+    return {
+      id, text: raw.text, createdAt, tags,
+      favorites: count(raw.likenum),
+      comments: count(raw.comment_total ?? raw.reply),
+      pinned: Boolean(Number(raw.is_top ?? 0)),
+      references: [...new Set(raw.text.normalize('NFKC').match(/\d{6,}/g) ?? [])]
+    };
+  }
+
+  function parsePage(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('接口响应格式变化，已停止读取');
+    if (payload.code !== undefined && Number(payload.code) !== 20000 && Number(payload.code) !== 200) {
+      throw new Error('树洞未返回成功结果，请确认登录状态或稍后重试');
+    }
+    if (payload.success === false) throw new Error('树洞拒绝了请求，请确认登录状态');
+    const data = payload.data;
+    const rows = Array.isArray(data) ? data : data?.list ?? data?.data;
+    if (!Array.isArray(rows)) throw new Error('接口中没有预期的帖子列表，已停止读取');
+    const posts = rows.map(normalizePost);
+    if (posts.some(post => !post)) throw new Error('帖子字段发生变化，已停止读取，避免生成错误榜单');
+    return { posts, total: count(data?.total), lastPage: count(data?.last_page) };
+  }
+
+  function subscriptionKey(subscription) {
+    return fold(typeof subscription === 'string' ? subscription : subscription.value).replace(/^#+/, '').trim();
+  }
+
+  function normalizeSubscriptions(subscriptions) {
+    const unique = new Map();
+    for (const subscription of Array.isArray(subscriptions) ? subscriptions : []) {
+      const value = String(typeof subscription === 'string' ? subscription : subscription?.value ?? '')
+        .normalize('NFKC').trim().replace(/^#+/, '').trim();
+      if (value && value.length <= 60 && !unique.has(subscriptionKey(value))) unique.set(subscriptionKey(value), { value });
+      if (unique.size >= 30) break;
+    }
+    return [...unique.values()];
+  }
+
+  function containsKeyword(text, value) {
+    const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const left = /^[a-z0-9_]/i.test(value) ? '(^|[^a-z0-9_])' : '';
+    const right = /[a-z0-9_]$/i.test(value) ? '($|[^a-z0-9_])' : '';
+    return new RegExp(left + escaped + right, 'u').test(fold(text));
+  }
+
+  function matches(post, subscription) {
+    const value = subscriptionKey(subscription);
+    if (!value) return false;
+    return post.tags.some(tag => containsKeyword(tag, value)) || containsKeyword(post.text, value);
+  }
+
+  function selectPosts(posts, window, subscriptions = []) {
+    return posts.filter(post => post.createdAt >= window.start && post.createdAt < window.end &&
+      (!subscriptions.length || subscriptions.some(subscription => matches(post, subscription))));
+  }
+
+  // Each referring post contributes at most once; self references do not count.
+  function referenceCounts(posts) {
+    const counts = new Map();
+    for (const post of new Map(posts.map(post => [post.id, post])).values()) {
+      for (const id of post.references) {
+        if (id !== post.id) counts.set(id, (counts.get(id) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }
+
+  function rank(posts, metric, references = referenceCounts(posts)) {
+    if (!['favorites', 'comments', 'references', 'newest'].includes(metric)) throw new Error('未知排序');
+    const value = post => metric === 'newest' ? post.createdAt :
+      metric === 'references' ? references.get(post.id) ?? 0 : post[metric];
+    return [...posts].sort((a, b) => {
+      const av = value(a), bv = value(b);
+      if (av === null && bv !== null) return 1;
+      if (bv === null && av !== null) return -1;
+      return (bv ?? -1) - (av ?? -1) || b.createdAt - a.createdAt || Number(b.id) - Number(a.id);
+    });
+  }
+
+  function cacheKey(window) { return window.date === '过去 24 小时' ? 'rolling' : `day:${window.date}`; }
+
+  function createCache({ storage, key = 'treehole-daily-digest:cache:v2', ttlMs = CACHE_TTL_MS, now = Date.now, maxEntries = 3 }) {
+    let memory = [];
+    function readEntries() {
+      let items = [...memory];
+      try {
+        const value = JSON.parse(storage.getItem(key) || 'null');
+        if (value?.schema === 2 && Array.isArray(value.items)) items.push(...value.items);
+      } catch { /* Retain the current page's memory cache. */ }
+      items = items.filter(item => item && Number.isFinite(item.savedAt) &&
+        now() >= item.savedAt && now() - item.savedAt < ttlMs).sort((a, b) => b.savedAt - a.savedAt);
+      return [...new Map(items.reverse().map(item => [item.scope, item])).values()].sort((a, b) => b.savedAt - a.savedAt);
+    }
+    function read(window) {
+      const entry = readEntries().find(item => item.scope === cacheKey(window));
+      if (!entry || !Array.isArray(entry.posts) || entry.posts.length > 3000 ||
+        !Number.isFinite(entry.fetchedAt) || !Number.isFinite(entry.window?.start) || !Number.isFinite(entry.window?.end) ||
+        cacheKey(entry.window) !== cacheKey(window) || !['boundary', 'end', 'limit', 'repeated'].includes(entry.reason)) return null;
+      // Re-normalize text so old matching/reference rules never survive a script update.
+      const posts = entry.posts.map(post => normalizePost({
+        pid: post?.id, text: post?.text, timestamp: post?.createdAt,
+        likenum: post?.favorites, comment_total: post?.comments, labels: post?.tags, is_top: post?.pinned
+      }));
+      if (posts.some(post => !post)) return null;
+      return { ...entry, posts };
+    }
+    function write(result, window, fetchedAt) {
+      const entry = {
+        scope: cacheKey(window), savedAt: now(), fetchedAt, window: { ...window },
+        pages: result.pages, reason: result.reason,
+        posts: result.posts.map(post => ({ id: post.id, text: post.text, createdAt: post.createdAt,
+          favorites: post.favorites, comments: post.comments, tags: post.tags, pinned: post.pinned }))
+      };
+      const items = [entry, ...readEntries().filter(item => item.scope !== entry.scope)].slice(0, maxEntries);
+      memory = items;
+      // Under a small browser quota retain just the current result; otherwise degrade to in-memory use.
+      for (const candidates of [items, [entry]]) {
+        try { storage.setItem(key, JSON.stringify({ schema: 2, items: candidates })); return true; }
+        catch { /* Storage may be disabled or full. */ }
+      }
+      return false;
+    }
+    function clear() { memory = []; try { storage.removeItem(key); } catch { /* Optional browser storage. */ } }
+    return { read, write, clear };
+  }
+
+  function abortError() { return new DOMException('已停止读取', 'AbortError'); }
+
+  function delay(ms, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(abortError());
+      const finish = () => { signal?.removeEventListener('abort', cancel); resolve(); };
+      const timer = setTimeout(finish, ms);
+      function cancel() { clearTimeout(timer); signal.removeEventListener('abort', cancel); reject(abortError()); }
+      signal?.addEventListener('abort', cancel, { once: true });
+    });
+  }
+
+  async function collect({ fetchPage, window, maxPages = 60, delayMs = 1200, signal, onProgress = () => {}, sleep = delay }) {
+    const posts = new Map();
+    const signatures = new Set();
+    let oldPages = 0;
+    let pages = 0;
+    for (let page = 1; page <= maxPages; page++) {
+      if (signal?.aborted) throw abortError();
+      const parsed = parsePage(await fetchPage(page, signal));
+      pages = page;
+      const signature = parsed.posts.map(post => post.id).join(',');
+      if (parsed.posts.length && signatures.has(signature)) return { posts: [...posts.values()], pages, reason: 'repeated' };
+      signatures.add(signature);
+      for (const post of parsed.posts) posts.set(post.id, post);
+      onProgress({ pages, count: posts.size });
+      if (!parsed.posts.length) return { posts: [...posts.values()], pages, reason: 'end' };
+      const normal = parsed.posts.filter(post => !post.pinned);
+      oldPages = normal.length && normal.every(post => post.createdAt < window.start) ? oldPages + 1 : 0;
+      // Two older pages tolerate pinned/isolated older posts; the API is assumed newest-first.
+      if (oldPages >= 2) return { posts: [...posts.values()], pages, reason: 'boundary' };
+      if (parsed.lastPage !== null && page >= parsed.lastPage) return { posts: [...posts.values()], pages, reason: 'end' };
+      // Do not infer exhaustion from a short page or total: the server may cap either.
+      if (page < maxPages) await sleep(delayMs, signal);
+    }
+    return { posts: [...posts.values()], pages, reason: 'limit' };
+  }
+
+  function makeFetcher({ fetchImpl, getHeaders, origin = 'https://treehole.pku.edu.cn', timeoutMs = 15000 }) {
+    if (new URL(origin).origin !== 'https://treehole.pku.edu.cn') throw new Error('只能向树洞原站发送请求');
+    return async (page, signal) => {
+      const url = new URL(API_PATH, origin);
+      url.search = new URLSearchParams({ page, limit: 50, comment_limit: 0, keyword: '' });
+      const controller = new AbortController();
+      const cancel = () => controller.abort();
+      if (signal?.aborted) throw abortError();
+      signal?.addEventListener('abort', cancel, { once: true });
+      const timer = setTimeout(cancel, timeoutMs);
+      try {
+        const response = await fetchImpl(url.href, {
+          method: 'GET', credentials: 'include', redirect: 'error',
+          headers: getHeaders(), signal: controller.signal
+        });
+        if (response.status === 401 || response.status === 403) throw new Error('登录已失效，请在树洞原页重新登录后重试');
+        if (response.status === 429) throw new Error('读取频率受到限制，已停止；请过一段时间再试');
+        if (!response.ok) throw new Error(`读取失败（HTTP ${response.status}），请稍后重试`);
+        return await response.json();
+      } catch (error) {
+        if (signal?.aborted) throw abortError();
+        if (controller.signal.aborted) throw new Error('请求超时，已停止读取，请稍后重试');
+        if (error instanceof SyntaxError) throw new Error('树洞没有返回 JSON，请确认登录状态');
+        // Browser network errors may include URLs; never display raw request details.
+        if (error instanceof TypeError) throw new Error('无法连接树洞，请检查网络并确认登录状态');
+        throw error;
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', cancel);
+      }
+    };
+  }
+
+  return { ZONE, API_PATH, CACHE_TTL_MS, fold, dayKey, timeWindow, timestamp, normalizePost, parsePage,
+    subscriptionKey, normalizeSubscriptions, matches, selectPosts, referenceCounts, rank, cacheKey, createCache, collect, makeFetcher };
+});
+
+globalThis.TreeholeDigestStyle = ":host {\n  all: initial;\n  font: 14px/1.6 -apple-system, BlinkMacSystemFont, \"PingFang SC\", \"Microsoft Yahei\", sans-serif;\n  color: #252b29;\n  color-scheme: light;\n}\n* { box-sizing: border-box; }\nbutton, input, select { font: inherit; }\nbutton, a, input, select { touch-action: manipulation; }\nbutton { cursor: pointer; border: 1px solid #dfe5e1; background: #fff; color: #34433b; border-radius: 8px; padding: 8px 13px; }\nbutton:hover { background: #f3f6f4; }\nbutton:disabled { cursor: wait; opacity: .5; }\nbutton:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #49755b; outline-offset: 3px; }\ninput, select { min-width: 0; padding: 8px 10px; border: 1px solid #dfe5e1; border-radius: 8px; background: #fff; color: #34433b; }\ninput[type=checkbox] { accent-color: #365d46; width: 15px; height: 15px; }\na { color: #587263; text-decoration: none; }\na:hover { text-decoration: underline; text-underline-offset: 3px; }\n[hidden] { display: none !important; }\n.launcher { position: fixed; right: 24px; bottom: 24px; z-index: 2147483646; padding: 11px 19px; border: 0; border-radius: 24px; background: #365d46; color: #fff; box-shadow: 0 4px 18px #19332526; font-weight: 500; }\n.launcher:hover, .primary:hover { background: #294e37; }\ndialog { position: fixed; inset: 0; margin: auto; width: min(880px, calc(100vw - 40px)); max-width: 880px; height: min(760px, 92dvh); max-height: 92dvh; padding: 0; overflow: auto; scrollbar-gutter: stable; border: 1px solid #dce3d5; border-radius: 16px; background: #f3f6ed; color: #252b29; box-shadow: 0 18px 64px #132e2526; }\ndialog::backdrop { background: #18272070; backdrop-filter: blur(3px); }\n.paper { display: flex; flex-direction: column; min-height: 100%; padding: 28px 36px 22px; }\n.heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 26px; }\n.masthead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 19px; padding-bottom: 12px; border-bottom: 1px solid #63765e; color: #77827b; font-size: 10px; font-weight: 500; letter-spacing: 1.3px; }\nh1 { margin: 0; color: #244e36; font-size: 40px; line-height: 1.3; font-weight: 650; letter-spacing: -.5px; }\n.edition { color: #7a847d; font-size: 12px; font-variant-numeric: tabular-nums; }\n.icon { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border: 0; background: transparent; color: #77827b; font-size: 23px; line-height: 1; }\n.demo-note { margin: 0 0 18px; padding: 7px 10px; border-radius: 6px; background: #f7f2e7; color: #82662f; font-size: 12px; }\n.controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }\n.controls>label:first-child { display: flex; align-items: center; gap: 8px; color: #69756d; font-size: 12px; }\n.check { display: inline-flex; align-items: center; gap: 6px; color: #69756d; font-size: 12px; cursor: pointer; }\n.primary { margin-left: auto; border-color: #365d46; background: #365d46; color: #fff; font-weight: 500; white-space: nowrap; }\n.force-refresh { border-color: transparent; color: #69756d; font-size: 12px; }\n.status { margin: 10px 0 0; color: #7a847d; font-size: 12px; }\n.status:empty { display: none; }\n.tabs { display: flex; gap: 25px; margin-top: 23px; border-bottom: 1px solid #e9edea; }\n.tabs button { padding: 11px 0; margin-bottom: -1px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: #7a847d; font-weight: 500; }\n.tabs button[aria-pressed=true] { border-bottom-color: #365d46; color: #365d46; }\n.sub-count { margin-left: 4px; padding: 1px 6px; border-radius: 8px; background: #f0f3f1; color: #7a847d; font-size: 10px; font-variant-numeric: tabular-nums; }\n.subscriptions { padding: 18px 0; border-bottom: 1px solid #e9edea; }\n.subscribe-form { display: flex; gap: 8px; }\n.sub-input-wrap { flex: 1; }\n.sub-input { width: 100%; }\n.sub-input::placeholder { color: #8b958e; font-size: 12px; }\n.chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }\n.chips:empty { margin: 0; }\n.chip-group { display: inline-flex; align-items: stretch; overflow: hidden; border: 1px solid #e0e7e2; border-radius: 7px; background: #f6f8f6; }\n.chip-group .chip { margin: 0; padding: 5px 11px; border: 0; border-radius: 0; background: transparent; font-size: 12px; }\n.chip[aria-pressed=true] { background: #e7efe8; color: #315b3e; font-weight: 500; }\n.remove-sub { padding: 4px 8px; border: 0; border-radius: 0; background: transparent; color: #8b958e; font-size: 14px; }\n.chip-group:focus-within { outline: 2px solid #49755b; outline-offset: 2px; }\n.read-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }\n.mark-read { padding: 3px 0; border: 0; background: transparent; color: #69756d; font-size: 12px; }\n.list-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 23px; }\nh2 { margin: 0; font-size: 17px; font-weight: 600; }\n.sort-label { color: #7a847d; font-size: 12px; }\n.sort { appearance: none; -webkit-appearance: none; margin-left: 5px; padding: 6px 29px 6px 11px; border: 1px solid #b8cbb9; border-radius: 10px; background-color: #fbfdf8; background-image: linear-gradient(45deg, transparent 50%, #63765e 50%), linear-gradient(135deg, #63765e 50%, transparent 50%); background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50%; background-size: 5px 5px; background-repeat: no-repeat; font-size: 12px; cursor: pointer; }\n.scope { margin: 5px 0 13px; color: #8b958e; font-size: 11px; }\n.posts { display: flex; flex: 1; flex-direction: column; }\n.post { display: flex; gap: 18px; padding: 22px 0; border-top: 1px solid #edf0ed; }\n.rank { min-width: 25px; padding-top: 1px; color: #a3afa6; font-size: 17px; font-weight: 500; font-variant-numeric: tabular-nums; }\n.post:nth-child(-n+3) .rank { color: #5b7e64; }\n.post-content { flex: 1; min-width: 0; }\n.meta { margin: 0 0 8px; color: #8b958e; font-size: 11px; font-variant-numeric: tabular-nums; }\n.body { margin: 0 0 13px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.85; }\n.stats { margin: 0 0 7px; color: #7a847d; font-size: 11px; }\n.post a { font-size: 11px; }\n.empty { display: grid; flex: 1; place-items: center; min-height: 140px; padding: 24px 16px; border-top: 1px solid #edf0ed; color: #8b958e; text-align: center; font-size: 13px; }\nfooter { display: flex; justify-content: flex-end; margin-top: 8px; padding-top: 17px; border-top: 1px solid #e9edea; color: #8b958e; font-size: 11px; }\nfooter .check { flex-shrink: 0; font-size: 11px; }\n.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }\n@media (max-width: 620px) {\n  dialog { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; border: 0; border-radius: 0; }\n  .paper { padding: 22px 18px; }\n  .heading { gap: 10px; margin-bottom: 22px; }\n  h1 { font-size: 34px; }\n  .masthead { font-size: 9px; letter-spacing: .8px; }\n  .edition { font-size: 11px; }\n  .controls { gap: 8px; }\n  .primary { margin-left: 0; flex: 1; }\n  .post { gap: 10px; padding: 19px 0; }\n  .rank { min-width: 23px; font-size: 15px; }\n  .stats { line-height: 1.9; }\n  .launcher { right: 15px; bottom: 15px; }\n}\n";
+
+(async function () {
+  'use strict';
+  const C = globalThis.TreeholeDigestCore;
+  const demo = document.documentElement.dataset.treeholeDemo === 'true' &&
+    (location.protocol === 'file:' || location.hostname === '127.0.0.1' || location.hostname === 'localhost');
+  if (!demo && (location.origin !== 'https://treehole.pku.edu.cn' || !/^\/(ch\/)?web(?:\/|$)/.test(location.pathname))) return;
+  if (document.querySelector('#treehole-digest')) return;
+
+  const PREFS = 'treehole-daily-digest:prefs:v1';
+  function loadPrefs() {
+    try {
+      const value = JSON.parse(localStorage.getItem(PREFS) || '{}');
+      const subscriptions = C.normalizeSubscriptions(value.subscriptions);
+      return {
+        subscriptions,
+        readThrough: Object.fromEntries(subscriptions.map(s => {
+          const key = C.subscriptionKey(s);
+          const read = Number(value.readThrough && typeof value.readThrough === 'object' ? value.readThrough[key] : value.readThrough);
+          return [key, Number.isFinite(read) && read >= 0 ? read : 0];
+        })),
+        autoOpen: value.autoOpen !== false
+      };
+    } catch { return { subscriptions: [], readThrough: {}, autoOpen: true }; }
+  }
+  const prefs = loadPrefs();
+  const state = { posts: [], window: C.timeWindow(C.dayKey()), metric: 'favorites', view: 'rank', busy: false,
+    result: null, fetchedAt: null, onlyNew: false, controller: null, activeWindow: null,
+    activeSubscription: prefs.subscriptions.length ? C.subscriptionKey(prefs.subscriptions[0]) : null };
+  let cache = C.createCache({ storage: null });
+  try {
+    const token = demo ? 'demo' : readHeaders().Authorization;
+    if (token) {
+      const owner = demo ? 'demo' : Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))),
+        byte => byte.toString(16).padStart(2, '0')).join('').slice(0, 24);
+      // The hash partitions results when the account changes, without storing credentials.
+      cache = C.createCache({ storage: sessionStorage, key: `treehole-daily-digest:cache:v2:${owner}` });
+    }
+  } catch { /* The current page can still use an in-memory cache. */ }
+
+  const host = document.createElement('div');
+  host.id = 'treehole-digest';
+  document.body.append(host);
+  const shadow = host.attachShadow({ mode: 'open' });
+  const style = document.createElement('style');
+  style.textContent = globalThis.TreeholeDigestStyle;
+  shadow.append(style);
+  const shell = document.createElement('div');
+  shell.innerHTML = `
+    <button class="launcher" aria-label="打开树洞日报">◒ 树洞日报</button>
+    <dialog aria-labelledby="digest-title">
+      <div class="paper">
+        <header>
+          <div class="masthead"><span>PKU TREEHOLE DAILY</span><span class="edition"></span></div>
+          <div class="heading"><h1 id="digest-title">树洞日报</h1><button class="icon close" aria-label="关闭日报">×</button></div>
+          <p class="demo-note" hidden>演示模式 · 所有帖子均为虚构，不读取校园账号</p>
+        </header>
+        <section class="controls" aria-label="日报筛选">
+          <label>阅读日期 <input type="date" class="date"></label>
+          <label class="check"><input type="checkbox" class="rolling">过去 24 小时</label>
+          <button class="primary refresh">Generate ↗</button>
+          <button class="force-refresh" title="忽略缓存，重新读取所选时段">Refresh</button>
+          <button class="stop" hidden>Stop</button>
+        </section>
+        <p class="status" role="status" aria-live="polite"></p>
+        <nav class="tabs" aria-label="内容类型">
+          <button data-view="rank" aria-pressed="true">今日热门</button>
+          <button data-view="subscriptions" aria-pressed="false">我的订阅 <span class="sub-count">0</span></button>
+        </nav>
+        <section class="subscriptions" hidden aria-label="管理订阅">
+          <form class="subscribe-form"><label class="sub-input-wrap"><span class="sr-only">订阅关键词</span><input class="sub-input" placeholder="输入关键词，例如：暂时不能给你明确的答复、discouraged" maxlength="60" required></label><button type="submit" aria-label="添加订阅">Add</button></form>
+          <div class="chips"></div>
+          <div class="read-controls"><label class="check"><input type="checkbox" class="only-new">只看未读</label><button class="mark-read">标为已读</button></div>
+        </section>
+        <div class="list-heading"><h2>今日收藏榜</h2><label class="sort-label">排序 <select class="sort"><option value="favorites">收藏最多</option><option value="comments">评论最多</option><option value="references">引用最多</option><option value="newest">最新发布</option></select></label></div>
+        <p class="scope"></p>
+        <section class="posts" aria-label="日报帖子列表"></section>
+        <footer><label class="check"><input type="checkbox" class="auto-open">打开树洞时显示日报</label></footer>
+      </div>
+    </dialog>`;
+  shadow.append(shell);
+  const $ = selector => shadow.querySelector(selector);
+  const $$ = selector => [...shadow.querySelectorAll(selector)];
+  const dialog = $('dialog');
+  const status = $('.status');
+  let opener;
+
+  function persist() {
+    try { localStorage.setItem(PREFS, JSON.stringify(prefs)); }
+    catch { status.textContent = '浏览器未允许保存偏好；当前页面仍可使用。'; }
+  }
+  function open() { opener = document.activeElement; if (!dialog.open) dialog.showModal(); }
+  function close() { dialog.close(); opener?.focus?.(); }
+  $('.launcher').onclick = open;
+  $('.close').onclick = close;
+  dialog.addEventListener('close', () => opener?.focus?.());
+  $('.date').value = C.dayKey();
+  $('.edition').textContent = C.dayKey().replaceAll('-', '.');
+  $('.demo-note').hidden = !demo;
+  $('.auto-open').checked = prefs.autoOpen;
+  $('.auto-open').onchange = event => { prefs.autoOpen = event.target.checked; persist(); };
+
+  function renderSubscriptions() {
+    $('.sub-count').textContent = prefs.subscriptions.length;
+    $('.chips').replaceChildren();
+    prefs.subscriptions.forEach((subscription, index) => {
+      const group = document.createElement('span'); group.className = 'chip-group';
+      const key = C.subscriptionKey(subscription);
+      const chip = document.createElement('button'); chip.className = 'chip';
+      chip.textContent = subscription.value;
+      chip.setAttribute('aria-pressed', String(key === state.activeSubscription));
+      chip.onclick = () => { state.activeSubscription = key; renderSubscriptions(); render(); };
+      const remove = document.createElement('button'); remove.className = 'remove-sub'; remove.textContent = '×';
+      remove.setAttribute('aria-label', `取消订阅 ${subscription.value}`);
+      remove.onclick = () => {
+        prefs.subscriptions.splice(index, 1); delete prefs.readThrough[key];
+        if (state.activeSubscription === key) state.activeSubscription = prefs.subscriptions.length ? C.subscriptionKey(prefs.subscriptions[0]) : null;
+        persist(); renderSubscriptions(); render();
+      };
+      group.append(chip, remove); $('.chips').append(group);
+    });
+  }
+
+  $('.subscribe-form').onsubmit = event => {
+    event.preventDefault();
+    const subscription = C.normalizeSubscriptions([$('.sub-input').value])[0];
+    if (!subscription) return;
+    if (prefs.subscriptions.length >= 30) { status.textContent = '最多可订阅 30 个话题。'; return; }
+    if (!prefs.subscriptions.some(s => C.subscriptionKey(s) === C.subscriptionKey(subscription))) prefs.subscriptions.push(subscription);
+    state.activeSubscription = C.subscriptionKey(subscription);
+    $('.sub-input').value = '';
+    persist(); renderSubscriptions(); render();
+  };
+  $$('.tabs button').forEach(button => {
+    button.onclick = () => {
+      state.view = button.dataset.view;
+      $$('.tabs button').forEach(tab => tab.setAttribute('aria-pressed', String(tab === button)));
+      $('.subscriptions').hidden = state.view !== 'subscriptions';
+      render();
+    };
+  });
+  $('.sort').onchange = event => { state.metric = event.target.value; render(); };
+  $('.only-new').onchange = event => { state.onlyNew = event.target.checked; render(); };
+  $('.mark-read').onclick = () => {
+    if (!state.fetchedAt || !state.activeSubscription || state.busy) return;
+    prefs.readThrough[state.activeSubscription] = state.fetchedAt;
+    persist(); render();
+    status.textContent = '已标为已读。';
+  };
+
+  function render() {
+    const inWindow = C.selectPosts(state.posts, state.window);
+    const references = C.referenceCounts(inWindow);
+    const subscribed = state.view === 'subscriptions';
+    const subscription = prefs.subscriptions.find(s => C.subscriptionKey(s) === state.activeSubscription);
+    const readThrough = Number(prefs.readThrough[state.activeSubscription]) || 0;
+    let selected = subscribed ? inWindow.filter(post => subscription && C.matches(post, subscription)) : inWindow;
+    if (subscribed && state.onlyNew) selected = selected.filter(post => post.createdAt > readThrough);
+    const metric = subscribed ? 'newest' : state.metric;
+    const ranked = C.rank(selected, metric, references);
+    $('.sort-label').hidden = subscribed;
+    $('.list-heading h2').textContent = subscribed ? '订阅新帖' : {
+      favorites: '今日收藏榜', comments: '今日评论榜', references: '今日引用榜', newest: '今日新帖'
+    }[metric];
+    if (state.window.date !== C.dayKey()) $('.list-heading h2').textContent = subscribed ? '订阅新帖' : {
+      favorites: '收藏榜', comments: '评论榜', references: '引用榜', newest: '新发布'
+    }[metric];
+    if (subscribed && subscription) $('.list-heading h2').textContent = `${subscription.value} · 新帖`;
+    $('.scope').textContent = `${state.window.date} · ${selected.length} 篇${metric === 'references' ? ' · 正文引用' : ''}`;
+    $('.posts').replaceChildren();
+    if (!ranked.length) {
+      const empty = document.createElement('div'); empty.className = 'empty';
+      empty.textContent = !state.result ? '尚未生成简报' :
+        subscribed && !prefs.subscriptions.length ? '暂无订阅' :
+        subscribed && state.onlyNew ? '暂无未读新帖' : '暂无符合条件的帖子';
+      $('.posts').append(empty);
+    }
+    ranked.slice(0, 100).forEach((post, index) => {
+      const article = document.createElement('article'); article.className = 'post';
+      const rank = document.createElement('span'); rank.className = 'rank'; rank.textContent = String(index + 1).padStart(2, '0');
+      const content = document.createElement('div'); content.className = 'post-content';
+      const meta = document.createElement('p'); meta.className = 'meta';
+      meta.textContent = `#${post.id} · ${new Intl.DateTimeFormat('zh-CN', { timeZone: C.ZONE, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(post.createdAt)}${post.createdAt > readThrough && subscribed ? ' · 未读' : ''}`;
+      const body = document.createElement('p'); body.className = 'body'; body.textContent = post.text || '（图片或其他非文字内容，请回原页查看）';
+      const stats = document.createElement('p'); stats.className = 'stats';
+      stats.textContent = `☆ ${post.favorites ?? '—'} stars　◌ ${post.comments ?? '—'} comments　↗ ${references.get(post.id) ?? 0} cites`;
+      const link = document.createElement('a'); link.href = 'https://treehole.pku.edu.cn/ch/web/pc/index';
+      link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = `回树洞，搜索 #${post.id} ↗`;
+      content.append(meta, body, stats, link); article.append(rank, content); $('.posts').append(article);
+    });
+    if (ranked.length > 100) {
+      const note = document.createElement('p'); note.textContent = `共 ${ranked.length} 篇，显示前 100 篇。`; $('.posts').append(note);
+    }
+  }
+
+  function readHeaders() {
+    const headers = { Accept: 'application/json' };
+    // Read only existing credentials at request time; never log, copy, or persist them.
+    let token = localStorage.getItem('token');
+    if (token) {
+      try { const parsed = JSON.parse(token); token = typeof parsed === 'string' ? parsed : parsed.token ?? parsed.access_token ?? ''; }
+      catch { /* Plain JWT / bearer token. */ }
+    }
+    if (!token) {
+      const cookie = document.cookie.split('; ').find(item => item.startsWith('pku_token='));
+      if (cookie) token = decodeURIComponent(cookie.slice('pku_token='.length));
+    }
+    if (token) headers.Authorization = /^Bearer /i.test(token) ? token : `Bearer ${token}`;
+    const uuid = localStorage.getItem('pku-uuid');
+    if (uuid) headers.Uuid = uuid;
+    return headers;
+  }
+
+  const fetchPage = demo ? globalThis.TreeholeDigestDemo.fetchPage : C.makeFetcher({
+    fetchImpl: window.fetch.bind(window), getHeaders: readHeaders
+  });
+  function updateWindow() {
+    state.window = C.timeWindow($('.date').value, $('.rolling').checked);
+    $('.date').disabled = $('.rolling').checked;
+  }
+  const timeLabel = value => new Intl.DateTimeFormat('zh-CN', {
+    timeZone: C.ZONE, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false
+  }).format(value);
+  const coverage = reason => ({ limit: ' · 达到抓取上限，结果可能不全',
+    repeated: ' · 接口返回重复页，结果可能不全' })[reason] || '';
+  function restoreCache() {
+    const entry = cache.read(state.window);
+    if (!entry) return false;
+    state.posts = entry.posts; state.window = entry.window; state.result = entry; state.fetchedAt = entry.fetchedAt;
+    status.textContent = `${demo ? '演示 · ' : ''}缓存 · ${timeLabel(entry.savedAt)} 更新${coverage(entry.reason)}`;
+    render(); return true;
+  }
+  function changedWindow() {
+    updateWindow();
+    state.posts = []; state.result = null; state.fetchedAt = null;
+    if (!restoreCache()) { status.textContent = '日期已切换，请重新生成简报。'; render(); }
+  }
+  $('.date').onchange = changedWindow;
+  $('.rolling').onchange = changedWindow;
+  $('.stop').onclick = () => state.controller?.abort();
+  async function generate(force = false) {
+    if (state.busy) return;
+    updateWindow();
+    if (!force && restoreCache()) return;
+    state.activeWindow = { ...state.window };
+    state.busy = true; state.controller = new AbortController();
+    $('.refresh').disabled = true; $('.force-refresh').disabled = true; $('.date').disabled = true; $('.rolling').disabled = true; $('.stop').hidden = false;
+    $('.mark-read').disabled = true;
+    const startedAt = Date.now();
+    try {
+      const result = await C.collect({
+        fetchPage, window: state.activeWindow, signal: state.controller.signal, delayMs: demo ? 50 : 1200,
+        onProgress: ({ pages, count }) => { status.textContent = `正在整理第 ${pages} 页 · 已读取 ${count} 篇…`; }
+      });
+      state.posts = result.posts; state.result = result; state.window = state.activeWindow; state.fetchedAt = startedAt;
+      const stored = cache.write(result, state.window, startedAt);
+      status.textContent = `${demo ? '演示 · ' : ''}${timeLabel(Date.now())} 更新${stored ? ' · 缓存 5 分钟' : ' · 仅当前页面缓存'}${coverage(result.reason)}`;
+      render();
+    } catch (error) {
+      if (/登录/.test(error.message)) cache.clear();
+      status.textContent = error.name === 'AbortError' ? '已停止。本次结果未保存，可重新生成。' : `${error.message}。本次结果未保存。`;
+    } finally {
+      state.busy = false; state.controller = null;
+      $('.refresh').disabled = false; $('.force-refresh').disabled = false; $('.date').disabled = $('.rolling').checked; $('.rolling').disabled = false;
+      $('.stop').hidden = true; $('.mark-read').disabled = false;
+    }
+  }
+  $('.refresh').onclick = () => generate();
+  $('.force-refresh').onclick = () => generate(true);
+  renderSubscriptions();
+  if (!restoreCache()) render();
+  if (demo || prefs.autoOpen) open();
+})();
+
+})();

@@ -1,0 +1,12 @@
+{
+  "name": "treehole-daily-digest",
+  "version": "0.2.3",
+  "private": true,
+  "description": "A local, session-based daily digest for PKU Treehole",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.cjs",
+    "start": "node scripts/serve.mjs"
+  },
+  "engines": { "node": ">=20" }
+}
